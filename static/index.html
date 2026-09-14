@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Automate — Instagram</title>
+<style>
+:root{
+  --bg:#FAFAF8; --card:#FFFFFF; --text:#111111; --muted:#777777;
+  --border:#E8E8E5; --btn:#111111; --btnText:#FFFFFF;
+}
+[data-theme="black"]{
+  --bg:#0A0A0A; --card:#111111; --text:#FFFFFF; --muted:#888888;
+  --border:#242424; --btn:#FFFFFF; --btnText:#111111;
+}
+[data-theme="soft"]{
+  --bg:#F3F3F0; --card:#FAFAF8; --text:#161616; --muted:#777777;
+  --border:#DEDED9; --btn:#161616; --btnText:#FFFFFF;
+}
+*{box-sizing:border-box; margin:0; padding:0; -webkit-tap-highlight-color:transparent;}
+body{
+  background:var(--bg); color:var(--text);
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,Helvetica,Arial,sans-serif;
+  min-height:100vh; transition:background .25s, color .25s;
+}
+.wrap{max-width:640px; margin:0 auto; padding:28px 20px 80px;}
+.top{display:flex; justify-content:space-between; align-items:center; margin-bottom:40px;}
+.logo{font-size:20px; font-weight:600; letter-spacing:-.02em;}
+.status{display:flex; align-items:center; gap:7px; font-size:13px; color:var(--muted);
+  border:1px solid var(--border); background:var(--card); padding:7px 13px; border-radius:99px; cursor:pointer;}
+.dot{width:8px; height:8px; border-radius:50%; background:#d4d4d0;}
+.dot.on{background:#22c55e; box-shadow:0 0 0 3px rgba(34,197,94,.15);}
+h1{font-size:32px; letter-spacing:-.03em; font-weight:600; margin-bottom:6px;}
+.sub{color:var(--muted); font-size:15px; margin-bottom:34px;}
+h2{font-size:13px; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); font-weight:600; margin:44px 0 14px;}
+.card{background:var(--card); border:1px solid var(--border); border-radius:18px; padding:22px;}
+.btn{background:var(--btn); color:var(--btnText); border:none; border-radius:12px;
+  padding:14px 22px; font-size:15px; font-weight:600; cursor:pointer; width:100%; transition:opacity .15s;}
+.btn:hover{opacity:.85;}
+.btn:disabled{opacity:.4; cursor:not-allowed;}
+.btn.ghost{background:transparent; color:var(--text); border:1px solid var(--border);}
+.btn.meta{background:#0064E0; color:#fff; display:flex; align-items:center; justify-content:center; gap:10px;}
+.btn.meta svg{flex:none;}
+.row{display:flex; gap:10px;}
+.row .btn{width:auto; flex:1;}
+/* ---- automation cards ---- */
+.auto{display:flex; flex-direction:column; gap:12px; margin-bottom:12px; transition:transform .1s;}
+.auto:hover{transform:translateY(-1px);}
+.auto .head{display:flex; justify-content:space-between; align-items:center;}
+.auto .name{font-size:16px; font-weight:600;}
+.auto .desc{font-size:14px; color:var(--muted); line-height:1.5;}
+.auto .meta{display:flex; justify-content:space-between; font-size:12px; color:var(--muted); border-top:1px solid var(--border); padding-top:12px;}
+.switch{position:relative; width:42px; height:24px; flex:none; cursor:pointer;}
+.switch input{opacity:0; width:0; height:0;}
+.slider{position:absolute; inset:0; background:var(--border); border-radius:99px; transition:.2s;}
+.slider:before{content:""; position:absolute; width:18px; height:18px; left:3px; top:3px; background:#fff; border-radius:50%; transition:.2s; box-shadow:0 1px 3px rgba(0,0,0,.2);}
+input:checked + .slider{background:#22c55e;}
+input:checked + .slider:before{transform:translateX(18px);}
+/* ---- templates ---- */
+.templates{display:grid; grid-template-columns:1fr 1fr; gap:10px;}
+.tpl{border:1px solid var(--border); background:var(--card); border-radius:16px; padding:16px; cursor:pointer; transition:border-color .15s, transform .1s;}
+.tpl:hover{border-color:var(--text); transform:translateY(-1px);}
+.tpl b{display:block; font-size:14px; margin-bottom:5px;}
+.tpl span{font-size:12.5px; color:var(--muted); line-height:1.45;}
+/* ---- create flow ---- */
+.step-label{font-size:13px; font-weight:600; color:var(--muted); margin:0 0 8px 4px;}
+.step-label span{color:var(--text); font-weight:700; font-size:15px;}
+.flow-card{margin-bottom:18px; padding:18px;}
+select, textarea, input[type=text], input[type=password]{
+  width:100%; background:transparent; border:1px solid var(--border); color:var(--text);
+  border-radius:12px; padding:13px 14px; font-size:15px; font-family:inherit; outline:none; margin-bottom:8px;
+}
+select:focus, textarea:focus, input:focus{border-color:var(--text);}
+textarea{min-height:100px; resize:vertical; line-height:1.5;}
+select{appearance:none; cursor:pointer;}
+.field-label{font-size:12px; color:var(--muted); margin:0 0 6px 4px;}
+/* ---- connect / consent ---- */
+.consent{display:flex; gap:10px; align-items:flex-start; font-size:13px; color:var(--muted); line-height:1.55; margin:14px 0; cursor:pointer;}
+.consent input{width:18px; height:18px; margin-top:1px; accent-color:var(--btn); flex:none;}
+.error{background:rgba(239,68,68,.1); color:#dc2626; border-radius:10px; padding:10px 13px; font-size:13px; margin-bottom:12px; display:none;}
+.notice{background:rgba(234,179,8,.1); color:#a16207; border-radius:10px; padding:11px 14px; font-size:13px; line-height:1.55; margin-bottom:14px;}
+[data-theme="black"] .notice{color:#fbbf24;}
+[data-theme="black"] .error{color:#f87171;}
+.small{font-size:12px; color:var(--muted); text-align:center; margin-top:12px; line-height:1.6;}
+.hidden{display:none !important;}
+.back{background:none; border:none; color:var(--muted); font-size:14px; cursor:pointer; margin-bottom:18px; padding:0;}
+.back:hover{color:var(--text);}
+.theme-picker{display:flex; gap:8px; margin-bottom:26px;}
+.theme-picker button{flex:1; padding:9px; border-radius:10px; border:1px solid var(--border); background:var(--card); color:var(--muted); font-size:12.5px; cursor:pointer;}
+.theme-picker button.active{color:var(--text); border-color:var(--text); font-weight:600;}
+.empty{text-align:center; padding:34px 10px; color:var(--muted); font-size:14px; border:1px dashed var(--border); border-radius:16px;}
+details summary{cursor:pointer; font-size:13px; color:var(--muted); text-align:center; padding:12px 0 2px; list-style:none;}
+details summary::-webkit-details-marker{display:none;}
+details summary:hover{color:var(--text);}
+details[open] summary{color:var(--text);}
+</style>
+</head>
+<body data-theme="white">
+<div class="wrap">
+
+  <div class="top">
+    <div class="logo">Automate</div>
+    <div class="status" id="statusPill"><span class="dot" id="statusDot"></span><span id="statusText">Checking…</span></div>
+  </div>
+
+  <!-- ============ CONNECT ============ -->
+  <div id="connectView">
+    <h1>Connect Instagram</h1>
+    <p class="sub">Automations that run for you.</p>
+    <div class="theme-picker" id="themePicker">
+      <button data-t="white" class="active">White</button>
+      <button data-t="black">Black</button>
+      <button data-t="soft">Soft</button>
+    </div>
+    <div class="card">
+      <div class="notice"><b>Before you continue — please read:</b><br>
+      You connect <b>your own</b> Instagram Business/Creator account. Automation runs only on your account, only for rules you create, and you can disconnect anytime.
+      Instagram/Meta's Platform Terms apply — no spam, no bulk unsolicited messaging. This tool uses only the official Instagram API.</div>
+
+      <div class="error" id="connErr"></div>
+
+      <label class="consent"><input type="checkbox" id="consentBox">
+        <span>I own this account, I consent to this tool reading comments on my posts and sending replies/DMs per my own automations, and I accept Meta's Platform Terms and this tool's disclaimer.</span></label>
+
+      <button class="btn meta" id="oauthBtn">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><rect x="2" y="2" width="20" height="20" rx="5" fill="#fff"/><circle cx="12" cy="12" r="4.2" fill="none" stroke="#0064E0" stroke-width="1.8"/><circle cx="17.3" cy="6.7" r="1.3" fill="#0064E0"/></svg>
+        <span id="oauthBtnText">Continue with Instagram</span>
+      </button>
+
+      <details>
+        <summary>Or connect manually with a token</summary>
+        <div style="padding-top:12px;">
+          <div class="field-label">Instagram User ID</div>
+          <input type="text" id="igUserId" placeholder="17841400000000000" autocomplete="off">
+          <div class="field-label">Long-lived Access Token</div>
+          <input type="password" id="igToken" placeholder="EAA..." autocomplete="off">
+          <button class="btn ghost" id="connectBtn" style="margin-top:6px;">Connect with token</button>
+        </div>
+      </details>
+
+      <p class="small">First time? The server owner configures the Meta app (see README step 1, one-time).<br>Credentials are stored only on your own server.</p>
+    </div>
+  </div>
+
+  <!-- ============ MAIN ============ -->
+  <div id="mainView" class="hidden">
+    <h1>Instagram</h1>
+    <p class="sub">Automations that run for you.</p>
+
+    <div class="card" style="padding:20px;">
+      <div style="margin-bottom:16px;"><b style="font-size:15px;">New automation</b></div>
+      <div class="step-label"><span>When</span> something happens</div>
+      <div class="flow-card card" style="margin:0 0 16px; cursor:pointer;" onclick="startCreate('comment')">
+        <div style="display:flex;justify-content:space-between;align-items:center;">
+          <div><b style="font-size:15px;">Instagram comment</b><div style="font-size:13px;color:var(--muted);margin-top:3px;">Someone comments on your post</div></div>
+          <span style="color:var(--muted)">›</span>
+        </div>
+      </div>
+      <div class="step-label"><span>Then</span> do this</div>
+      <div class="flow-card card" style="margin:0 0 18px; cursor:pointer;" onclick="startCreate('keyword')">
+        <div style="display:flex;justify-content:space-between;align-items:center;">
+          <div><b style="font-size:15px;">Keyword → DM</b><div style="font-size:13px;color:var(--muted);margin-top:3px;">Send a DM when someone says a word</div></div>
+          <span style="color:var(--muted)">›</span>
+        </div>
+      </div>
+      <div class="row">
+        <button class="btn ghost" id="disconnectBtn">Disconnect</button>
+        <button class="btn" onclick="startCreate('comment')">+ New automation</button>
+      </div>
+    </div>
+
+    <h2>Your automations</h2>
+    <div id="autoList"></div>
+
+    <h2>Start with something</h2>
+    <div class="templates">
+      <div class="tpl" onclick="startCreate('comment','reply')"><b>Comment → Reply</b><span>Automatically reply to comments</span></div>
+      <div class="tpl" onclick="startCreate('keyword','dm')"><b>Keyword → DM</b><span>Send a DM when someone says a specific word</span></div>
+    </div>
+    <div class="notice" style="margin-top:20px;">“New follower” automations are not offered: Instagram's official API does not expose follower events. Tools offering it use private APIs that violate Instagram's terms and can get your account banned.</div>
+  </div>
+
+  <!-- ============ CREATE ============ -->
+  <div id="createView" class="hidden">
+    <button class="back" onclick="show('mainView')">‹ Back</button>
+    <h1 id="createTitle">New automation</h1>
+    <p class="sub">When → Do → Turn on. That's it.</p>
+
+    <div class="step-label"><span>When</span></div>
+    <div class="card flow-card">
+      <select id="fTrigger">
+        <option value="comment">Instagram comment — someone comments</option>
+        <option value="keyword">Keyword — someone comments a specific word</option>
+      </select>
+    </div>
+
+    <div id="kwWrap" class="hidden">
+      <div class="field-label">Keyword</div>
+      <input type="text" id="fKeyword" placeholder="e.g. price">
+    </div>
+
+    <div class="step-label"><span>Then</span></div>
+    <div class="card flow-card">
+      <select id="fAction">
+        <option value="reply">Send a reply to the comment</option>
+        <option value="dm">Send a DM to the commenter</option>
+      </select>
+    </div>
+
+    <div class="field-label" id="msgLabel">Reply</div>
+    <textarea id="fMessage" placeholder="Thanks for reaching out!"></textarea>
+
+    <div class="error" id="createErr"></div>
+    <button class="btn" id="turnOnBtn">Turn on automation</button>
+    <p class="small">The automation starts working as soon as your webhook receives comment events (see README, step 4).</p>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const api = (u, m='GET', b) => fetch(u, {method:m, headers:{'Content-Type':'application/json'}, body:b?JSON.stringify(b):undefined}).then(r=>r.json());
+let status = null;
+
+/* ---------- OAuth redirect params ---------- */
+const qp = new URLSearchParams(location.search);
+if(qp.get('connected')){ history.replaceState(null,'',location.pathname); }
+if(qp.get('oauth_error')){
+  show('connectView');
+  $('#connErr').textContent = decodeURIComponent(qp.get('oauth_error'));
+  $('#connErr').style.display = 'block';
+  history.replaceState(null,'',location.pathname);
+}
+
+/* ---------- theme ---------- */
+const theme = localStorage.getItem('theme') || 'white';
+document.body.dataset.theme = theme;
+document.querySelectorAll('#themePicker button').forEach(b=>{
+  b.classList.toggle('active', b.dataset.t===theme);
+  b.onclick = ()=>{ localStorage.setItem('theme', b.dataset.t); document.body.dataset.theme=b.dataset.t;
+    document.querySelectorAll('#themePicker button').forEach(x=>x.classList.toggle('active', x===b)); };
+});
+
+function show(id){ ['connectView','mainView','createView'].forEach(v=>$('#'+v).classList.toggle('hidden', v!==id)); }
+
+/* ---------- status ---------- */
+async function refreshStatus(){
+  status = await api('/api/status');
+  const on = status.connected;
+  $('#statusDot').classList.toggle('on', on);
+  $('#statusText').textContent = on ? 'Connected' : 'Not connected';
+  show(on ? 'mainView' : 'connectView');
+  $('#oauthBtn').disabled = !status.oauth_configured;
+  $('#oauthBtnText').textContent = status.oauth_configured
+    ? 'Continue with Instagram'
+    : 'Continue with Instagram (owner must add FB_APP_ID in .env)';
+  if(on) loadAutos();
+}
+$('#statusPill').onclick = refreshStatus;
+
+/* ---------- OAuth button ---------- */
+$('#oauthBtn').onclick = async () => {
+  $('#connErr').style.display='none';
+  if(!$('#consentBox').checked){
+    $('#connErr').textContent = 'Please accept the consent & disclaimer first.';
+    $('#connErr').style.display='block'; return;
+  }
+  const r = await api('/api/oauth/url');
+  if(!r.ok){ $('#connErr').textContent = r.error; $('#connErr').style.display='block'; return; }
+  sessionStorage.setItem('consent_given','1');
+  window.location.href = r.url;
+};
+/* consent persists across the OAuth redirect */
+if(sessionStorage.getItem('consent_given')){
+  $('#consentBox').checked = true;
+  sessionStorage.removeItem('consent_given');
+}
+
+/* ---------- manual fallback ---------- */
+$('#connectBtn').onclick = async () => {
+  $('#connErr').style.display='none';
+  if(!$('#consentBox').checked){
+    $('#connErr').textContent = 'Please accept the consent & disclaimer first.';
+    $('#connErr').style.display='block'; return;
+  }
+  $('#connectBtn').disabled = true; $('#connectBtn').textContent = 'Connecting…';
+  const r = await api('/api/connect','POST',{
+    ig_user_id: $('#igUserId').value.trim(),
+    access_token: $('#igToken').value.trim(),
+    consent: true
+  });
+  $('#connectBtn').disabled = false; $('#connectBtn').textContent = 'Connect with token';
+  if(r.ok){ await refreshStatus(); }
+  else { $('#connErr').textContent = r.error || 'Connection failed.'; $('#connErr').style.display='block'; }
+};
+
+$('#disconnectBtn').onclick = async () => { await api('/api/disconnect','POST'); refreshStatus(); };
+
+/* ---------- create flow ---------- */
+function startCreate(trigger, action){
+  $('#fTrigger').value = trigger;
+  $('#fAction').value = action || (trigger==='keyword'?'dm':'reply');
+  $('#createTitle').textContent = trigger==='keyword' ? 'Keyword → DM' : 'Comment → Reply';
+  syncForm(); show('createView'); $('#createErr').style.display='none';
+}
+function syncForm(){
+  const t=$('#fTrigger').value;
+  $('#kwWrap').classList.toggle('hidden', t!=='keyword');
+  if(t==='keyword') $('#fAction').value='dm';
+  $('#msgLabel').textContent = $('#fAction').value==='dm' ? 'Message (sent as DM)' : 'Reply';
+  $('#createTitle').textContent = t==='keyword' ? 'Keyword → DM' : 'Comment → Reply';
+}
+$('#fTrigger').onchange = syncForm; $('#fAction').onchange = syncForm;
+
+$('#turnOnBtn').onclick = async () => {
+  $('#createErr').style.display='none';
+  const r = await api('/api/automations','POST',{
+    trigger: $('#fTrigger').value, action: $('#fAction').value,
+    keyword: $('#fKeyword').value, message: $('#fMessage').value, on: true
+  });
+  if(r.error){ $('#createErr').textContent=r.error; $('#createErr').style.display='block'; return; }
+  $('#fKeyword').value=''; $('#fMessage').value='';
+  show('mainView'); loadAutos();
+};
+
+/* ---------- list ---------- */
+function ago(iso){
+  if(!iso) return 'Never run';
+  const s = (Date.now()-new Date(iso))/1000;
+  if(s<60) return 'Last run · just now';
+  if(s<3600) return `Last run · ${Math.floor(s/60)} min ago`;
+  if(s<86400) return `Last run · ${Math.floor(s/3600)} h ago`;
+  return `Last run · ${Math.floor(s/86400)} d ago`;
+}
+function esc(s){ return (s||'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+async function loadAutos(){
+  const autos = await api('/api/automations');
+  const el = $('#autoList');
+  if(!autos.length){ el.innerHTML = '<div class="empty">No automations yet.<br>Create your first one above.</div>'; return; }
+  el.innerHTML = autos.map(a=>`
+    <div class="card auto">
+      <div class="head">
+        <div class="name">${a.trigger==='keyword' ? 'Keyword → DM' : 'Comment → Reply'}</div>
+        <label class="switch" onclick="event.stopPropagation()">
+          <input type="checkbox" ${a.on?'checked':''} onchange="toggleAuto('${a.id}')"><span class="slider"></span>
+        </label>
+      </div>
+      <div class="desc">${a.trigger==='keyword'
+        ? `When a comment contains “<b>${esc(a.keyword)}</b>” → send DM`
+        : 'When someone comments → automatically reply'}</div>
+      <div class="desc" style="font-size:13px; border-left:3px solid var(--border); padding-left:10px; font-style:italic;">“${esc(a.message)}”</div>
+      <div class="meta">
+        <span>Instagram · ${a.stats.runs} run${a.stats.runs===1?'':'s'}${a.stats.last_error?' · <span style="color:#dc2626">error</span>':''}</span>
+        <span>${ago(a.stats.last_run)}</span>
+      </div>
+      <div class="row">
+        <button class="btn ghost" style="padding:9px;font-size:13px;" onclick="editAuto('${a.id}')">Edit</button>
+        <button class="btn ghost" style="padding:9px;font-size:13px;color:#dc2626;" onclick="deleteAuto('${a.id}')">Delete</button>
+      </div>
+    </div>`).join('');
+}
+async function toggleAuto(id){ await api(`/api/automations/${id}/toggle`,'PATCH'); loadAutos(); }
+async function deleteAuto(id){
+  if(!confirm('Delete this automation? This cannot be undone.')) return;
+  await api(`/api/automations/${id}`,'DELETE'); loadAutos();
+}
+async function editAuto(id){
+  const autos = await api('/api/automations');
+  const a = autos.find(x=>x.id===id);
+  if(!a) return;
+  const kw = a.trigger==='keyword' ? prompt('Keyword:', a.keyword) : a.keyword;
+  if(kw===null) return;
+  const msg = prompt(a.action==='dm' ? 'DM message:' : 'Reply text:', a.message);
+  if(msg===null || !msg.trim()) return;
+  await api(`/api/automations/${id}`,'PUT',{keyword: kw, message: msg});
+  loadAutos();
+}
+
+refreshStatus();
+setInterval(()=>{ if(status&&status.connected) loadAutos(); }, 30000);
+</script>
+</body>
+</html>
