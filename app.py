@@ -1,8 +1,9 @@
 """
 Insta-Automate — minimal Instagram automation (official Graph API only).
 Triggers: comment -> reply, keyword -> DM.
-Auth: Meta OAuth (Facebook Login) — user clicks "Continue with Instagram",
-grants permissions, and this app exchanges the code for tokens automatically.
+Auth: Instagram API with Instagram Login ("Instagram business login") —
+user clicks "Continue with Instagram", grants permissions, and this app
+exchanges the code for tokens automatically. No Facebook Page required.
 """
 import os, json, time, hmac, hashlib, threading, urllib.parse
 from datetime import datetime, timezone
@@ -11,23 +12,17 @@ import requests
 from dotenv import load_dotenv
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(BASE, ".env"))  # <-- .env was never loaded before; FB_APP_ID/APP_SECRET were always empty
+load_dotenv(os.path.join(BASE, ".env"))
 
-# Instagram API with Instagram Login ("Instagram business login") — no
-# Facebook Page required, user logs in directly with their Instagram
-# Business/Creator account. Different endpoints/tokens than classic
-# Facebook Login, so the base URLs below are Instagram-specific.
 IG_OAUTH = "https://www.instagram.com/oauth/authorize"
-IG_TOKEN_URL = "https://api.instagram.com/oauth/access_token"       # short-lived token
-IG_GRAPH = "https://graph.instagram.com/v21.0"                       # long-lived token + all API calls
+IG_TOKEN_URL = "https://api.instagram.com/oauth/access_token"
+IG_GRAPH = "https://graph.instagram.com/v21.0"
 DATA = os.path.join(BASE, "data")
 os.makedirs(DATA, exist_ok=True)
 
 AUTOMATIONS_FILE = os.path.join(DATA, "automations.json")
 CONFIG_FILE = os.path.join(DATA, "config.json")
 
-# Instagram-business-login scopes (note the "instagram_business_" prefix —
-# these replaced the old instagram_basic/instagram_manage_* names in 2025).
 SCOPES = ",".join([
     "instagram_business_basic",
     "instagram_business_manage_comments",
@@ -37,21 +32,18 @@ SCOPES = ",".join([
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
 
-# ---------------- config / env ----------------
 def env(k, d=""):
     v = os.getenv(k, "").strip()
     return v if v else d
 
-# Instagram business login can use its own App ID/Secret (App Dashboard ->
-# Instagram -> API setup with Instagram login -> "Instagram app ID/secret").
-# Falls back to the main Meta app id/secret if you haven't set separate ones.
-IG_APP_ID = env("IG_APP_ID") or env("FB_APP_ID")
-IG_APP_SECRET = env("IG_APP_SECRET") or env("APP_SECRET")
+# Accept either naming: IG_APP_ID / INSTAGRAM_APP_ID (and same for secret).
+IG_APP_ID = env("IG_APP_ID") or env("INSTAGRAM_APP_ID") or env("FB_APP_ID")
+IG_APP_SECRET = (env("IG_APP_SECRET") or env("INSTAGRAM_APP_SECRET")
+                 or env("APP_SECRET"))
 VERIFY_TOKEN = env("WEBHOOK_VERIFY_TOKEN", "dev-verify-token")
-REDIRECT_URI = env("OAUTH_REDIRECT_URI")  # e.g. https://your-url/api/oauth/callback
+REDIRECT_URI = env("OAUTH_REDIRECT_URI")
 BASE_URL = env("WEBHOOK_BASE_URL", "http://localhost:5000")
 
-# ---------------- storage ----------------
 def _load(path, default):
     try: return json.load(open(path))
     except Exception: return default
@@ -66,7 +58,6 @@ save_config = lambda cfg: _save(CONFIG_FILE, cfg)
 get_automations = lambda: _load(AUTOMATIONS_FILE, [])
 save_autos = lambda a: _save(AUTOMATIONS_FILE, a)
 
-# ---------------- Instagram API helpers ----------------
 def ig_token():
     return get_config().get("access_token") or ""
 
@@ -82,8 +73,6 @@ def ig_post(path, data=None, token=None):
     return requests.post(f"{IG_GRAPH}/{path}", data=p, timeout=20)
 
 def ig_post_json(path, payload=None, token=None):
-    """Some Graph API endpoints (e.g. /messages) require a nested JSON body,
-    not flat form fields. Access token goes in the query string instead."""
     return requests.post(f"{IG_GRAPH}/{path}",
                           params={"access_token": token or ig_token()},
                           json=payload or {}, timeout=20)
@@ -92,13 +81,15 @@ def validate_token():
     uid, tok = ig_user_id(), ig_token()
     if not uid or not tok:
         return {"ok": False, "connected": False, "error": "No credentials saved"}
-    r = requests.get(f"{IG_GRAPH}/{uid}", params={"fields": "id,username,name", "access_token": tok}, timeout=15)
+    r = requests.get(f"{IG_GRAPH}/{uid}",
+                     params={"fields": "id,username,name", "access_token": tok},
+                     timeout=15)
     if r.status_code == 200:
         info = r.json(); info["auth_method"] = get_config().get("auth_method", "manual")
         return {"ok": True, "connected": True, "account": info}
-    return {"ok": False, "connected": False, "error": r.json().get("error", {}).get("message", "Token invalid")}
+    return {"ok": False, "connected": False,
+            "error": r.json().get("error", {}).get("message", "Token invalid")}
 
-# ---------------- OAuth ----------------
 def oauth_redirect_uri():
     return REDIRECT_URI or f"{BASE_URL}/api/oauth/callback"
 
@@ -128,7 +119,8 @@ def oauth_callback():
         if "access_token" not in j:
             return redirect(f"/?oauth_error={urllib.parse.quote(j.get('error_message', j.get('error', 'token exchange failed')))}")
         short_token = j["access_token"]
-        ig_uid = j.get("user_id")
+        # Instagram sometimes nests user_id inside "data"; handle both shapes.
+        ig_uid = j.get("user_id") or (j.get("data") or {}).get("user_id")
         # 2. short-lived -> long-lived token (60 days, refreshable)
         r = requests.get(f"{IG_GRAPH}/access_token", params={
             "grant_type": "ig_exchange_token",
@@ -149,7 +141,6 @@ def oauth_callback():
     except Exception as e:
         return redirect(f"/?oauth_error={urllib.parse.quote(str(e))}")
 
-# ---------------- automation engine ----------------
 def mark_run(aid, success=True, note=""):
     autos = get_automations()
     for a in autos:
@@ -163,10 +154,6 @@ PROCESSED_FILE = os.path.join(DATA, "processed_comments.json")
 _processed_lock = threading.Lock()
 
 def already_processed(comment_id):
-    """Meta redelivers webhook events on retry/timeout, and our own auto-replies
-    land back on the same webhook as new comments. Without dedup + self-filtering
-    the bot would reply to its own replies forever. Keep a rolling window of the
-    last N processed comment ids on disk."""
     if not comment_id:
         return True
     with _processed_lock:
@@ -180,8 +167,6 @@ def already_processed(comment_id):
         return False
 
 def handle_comment(commenter_id, commenter_username, text, comment_id):
-    # Never react to comments made by the connected account itself
-    # (e.g. its own auto-reply) — that would create an infinite reply loop.
     if commenter_id and commenter_id == ig_user_id():
         return
     if already_processed(comment_id):
@@ -201,7 +186,6 @@ def handle_comment(commenter_id, commenter_username, text, comment_id):
                 mark_run(a["id"], r.status_code == 200,
                          r.json().get("error", {}).get("message", "") if r.status_code != 200 else "")
 
-# ---------------- webhook ----------------
 @app.route("/webhook", methods=["GET"])
 def webhook_verify():
     if request.args.get("hub.mode") == "subscribe" and request.args.get("hub.verify_token") == VERIFY_TOKEN:
@@ -210,7 +194,7 @@ def webhook_verify():
 
 def _signature_ok():
     if not IG_APP_SECRET:
-        return True  # dev mode
+        return True
     sig = request.headers.get("X-Hub-Signature-256", "")
     mac = hmac.new(IG_APP_SECRET.encode(), request.data, hashlib.sha256).hexdigest()
     return hmac.compare_digest(sig, "sha256=" + mac)
@@ -237,7 +221,6 @@ def webhook_receive():
     threading.Thread(target=process, daemon=True).start()
     return "ok", 200
 
-# ---------------- API ----------------
 @app.route("/api/status")
 def api_status():
     st = validate_token()
@@ -246,14 +229,15 @@ def api_status():
 
 @app.route("/api/connect", methods=["POST"])
 def api_connect():
-    """Manual consent-based fallback (owner enters their own credentials)."""
     d = request.get_json(force=True)
     token, uid = (d.get("access_token") or "").strip(), (d.get("ig_user_id") or "").strip()
     if d.get("consent") is not True:
         return jsonify({"ok": False, "error": "You must accept the disclaimer to continue."}), 400
     if not token or not uid:
         return jsonify({"ok": False, "error": "Access token and Instagram User ID are required."}), 400
-    r = requests.get(f"{IG_GRAPH}/{uid}", params={"fields": "id,username,name", "access_token": token}, timeout=15)
+    r = requests.get(f"{IG_GRAPH}/{uid}",
+                     params={"fields": "id,username,name", "access_token": token},
+                     timeout=15)
     if r.status_code != 200:
         return jsonify({"ok": False, "error": r.json().get("error", {}).get("message", "Invalid credentials")}), 400
     save_config({"access_token": token, "ig_user_id": uid, "auth_method": "manual",
@@ -323,7 +307,6 @@ def index():
 
 @app.route("/healthz")
 def healthz():
-    # Simple liveness endpoint for hosting platforms (Render/Railway/etc.)
     return jsonify({"ok": True}), 200
 
 if __name__ == "__main__":
