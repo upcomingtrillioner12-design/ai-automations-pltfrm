@@ -13,26 +13,26 @@ from dotenv import load_dotenv
 BASE = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE, ".env"))  # <-- .env was never loaded before; FB_APP_ID/APP_SECRET were always empty
 
-FB_API = "https://graph.facebook.com/v21.0"
-FB_OAUTH = "https://www.facebook.com/v21.0/dialog/oauth"
+# Instagram API with Instagram Login ("Instagram business login") — no
+# Facebook Page required, user logs in directly with their Instagram
+# Business/Creator account. Different endpoints/tokens than classic
+# Facebook Login, so the base URLs below are Instagram-specific.
+IG_OAUTH = "https://www.instagram.com/oauth/authorize"
+IG_TOKEN_URL = "https://api.instagram.com/oauth/access_token"       # short-lived token
+IG_GRAPH = "https://graph.instagram.com/v21.0"                       # long-lived token + all API calls
 DATA = os.path.join(BASE, "data")
 os.makedirs(DATA, exist_ok=True)
 
 AUTOMATIONS_FILE = os.path.join(DATA, "automations.json")
 CONFIG_FILE = os.path.join(DATA, "config.json")
 
-# Scopes needed: manage comments, send DMs, read page metadata (IG account link).
-# NOTE: pages_show_list and instagram_basic are required to list the user's Pages
-# and read their connected Instagram Business account — without them the
-# me/accounts lookup in oauth_callback() silently returns nothing.
+# Instagram-business-login scopes (note the "instagram_business_" prefix —
+# these replaced the old instagram_basic/instagram_manage_* names in 2025).
 SCOPES = ",".join([
-    "business_management",
-    "pages_show_list",
-    "pages_manage_metadata",
-    "pages_read_engagement",
-    "instagram_basic",
-    "instagram_manage_comments",
-    "instagram_manage_messages",
+    "instagram_business_basic",
+    "instagram_business_manage_comments",
+    "instagram_business_manage_messages",
+    "instagram_business_content_publish",
 ])
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
@@ -42,8 +42,11 @@ def env(k, d=""):
     v = os.getenv(k, "").strip()
     return v if v else d
 
-FB_APP_ID = env("FB_APP_ID")
-FB_APP_SECRET = env("APP_SECRET")
+# Instagram business login can use its own App ID/Secret (App Dashboard ->
+# Instagram -> API setup with Instagram login -> "Instagram app ID/secret").
+# Falls back to the main Meta app id/secret if you haven't set separate ones.
+IG_APP_ID = env("IG_APP_ID") or env("FB_APP_ID")
+IG_APP_SECRET = env("IG_APP_SECRET") or env("APP_SECRET")
 VERIFY_TOKEN = env("WEBHOOK_VERIFY_TOKEN", "dev-verify-token")
 REDIRECT_URI = env("OAUTH_REDIRECT_URI")  # e.g. https://your-url/api/oauth/callback
 BASE_URL = env("WEBHOOK_BASE_URL", "http://localhost:5000")
@@ -72,16 +75,16 @@ def ig_user_id():
 
 def ig_get(path, params=None, token=None):
     p = dict(params or {}); p["access_token"] = token or ig_token()
-    return requests.get(f"{FB_API}/{path}", params=p, timeout=20)
+    return requests.get(f"{IG_GRAPH}/{path}", params=p, timeout=20)
 
 def ig_post(path, data=None, token=None):
     p = dict(data or {}); p["access_token"] = token or ig_token()
-    return requests.post(f"{FB_API}/{path}", data=p, timeout=20)
+    return requests.post(f"{IG_GRAPH}/{path}", data=p, timeout=20)
 
 def ig_post_json(path, payload=None, token=None):
     """Some Graph API endpoints (e.g. /messages) require a nested JSON body,
     not flat form fields. Access token goes in the query string instead."""
-    return requests.post(f"{FB_API}/{path}",
+    return requests.post(f"{IG_GRAPH}/{path}",
                           params={"access_token": token or ig_token()},
                           json=payload or {}, timeout=20)
 
@@ -89,7 +92,7 @@ def validate_token():
     uid, tok = ig_user_id(), ig_token()
     if not uid or not tok:
         return {"ok": False, "connected": False, "error": "No credentials saved"}
-    r = requests.get(f"{FB_API}/{uid}", params={"fields": "id,username,name", "access_token": tok}, timeout=15)
+    r = requests.get(f"{IG_GRAPH}/{uid}", params={"fields": "id,username,name", "access_token": tok}, timeout=15)
     if r.status_code == 200:
         info = r.json(); info["auth_method"] = get_config().get("auth_method", "manual")
         return {"ok": True, "connected": True, "account": info}
@@ -101,11 +104,11 @@ def oauth_redirect_uri():
 
 @app.route("/api/oauth/url")
 def oauth_url():
-    if not FB_APP_ID:
-        return jsonify({"ok": False, "error": "Server not configured: set FB_APP_ID and APP_SECRET in .env"}), 500
-    url = (f"{FB_OAUTH}?client_id={FB_APP_ID}"
+    if not IG_APP_ID:
+        return jsonify({"ok": False, "error": "Server not configured: set IG_APP_ID and IG_APP_SECRET in .env"}), 500
+    url = (f"{IG_OAUTH}?client_id={IG_APP_ID}"
            f"&redirect_uri={urllib.parse.quote(oauth_redirect_uri(), safe='')}"
-           f"&scope={SCOPES}&response_type=code")
+           f"&response_type=code&scope={SCOPES}")
     return jsonify({"ok": True, "url": url})
 
 @app.route("/api/oauth/callback")
@@ -115,40 +118,31 @@ def oauth_callback():
     if err or not code:
         return redirect(f"/?oauth_error={urllib.parse.quote(err or 'authorization denied')}")
     try:
-        # 1. code -> short-lived user token
-        r = requests.get(f"{FB_API}/oauth/access_token", params={
-            "client_id": FB_APP_ID, "client_secret": FB_APP_SECRET,
+        # 1. code -> short-lived user token (~1 hour). Instagram business login
+        # requires this as a form-encoded POST, not a GET like classic FB OAuth.
+        r = requests.post(IG_TOKEN_URL, data={
+            "client_id": IG_APP_ID, "client_secret": IG_APP_SECRET,
+            "grant_type": "authorization_code",
             "redirect_uri": oauth_redirect_uri(), "code": code}, timeout=20)
         j = r.json()
         if "access_token" not in j:
-            return redirect(f"/?oauth_error={urllib.parse.quote(j.get('error', {}).get('message', 'token exchange failed'))}")
-        short = j["access_token"]
-        # 2. short-lived -> long-lived user token (60 days)
-        r = requests.get(f"{FB_API}/oauth/access_token", params={
-            "grant_type": "fb_exchange_token", "client_id": FB_APP_ID,
-            "client_secret": FB_APP_SECRET, "fb_exchange_token": short}, timeout=20)
-        user_token = r.json().get("access_token", short)
-        # 3. find the Facebook Page connected to the Instagram Business account
-        r = ig_get("me/accounts", {"fields": "id,name,access_token"}, token=user_token)
-        pages = (r.json() or {}).get("data", [])
-        chosen = None
-        for p in pages:
-            r2 = ig_get(p["id"], {"fields": "instagram_business_account{id,username,name}"}, token=user_token)
-            ig = (r2.json() or {}).get("instagram_business_account")
-            if ig:
-                chosen = {"page": p, "ig": ig}; break
-        if not chosen:
-            return redirect("/?oauth_error=" + urllib.parse.quote(
-                "No Facebook Page with a connected Instagram Business account found. Connect one in your Facebook Page settings first."))
-        # 4. store page token (long-lived user token => page token does not expire)
+            return redirect(f"/?oauth_error={urllib.parse.quote(j.get('error_message', j.get('error', 'token exchange failed')))}")
+        short_token = j["access_token"]
+        ig_uid = j.get("user_id")
+        # 2. short-lived -> long-lived token (60 days, refreshable)
+        r = requests.get(f"{IG_GRAPH}/access_token", params={
+            "grant_type": "ig_exchange_token",
+            "client_secret": IG_APP_SECRET, "access_token": short_token}, timeout=20)
+        lj = r.json()
+        long_token = lj.get("access_token", short_token)
+        # 3. fetch account profile directly — no Facebook Page lookup needed
+        r = ig_get("me", {"fields": "id,username,name,account_type"}, token=long_token)
+        profile = r.json() if r.status_code == 200 else {"id": ig_uid}
         save_config({
-            "access_token": chosen["page"]["access_token"],
-            "ig_user_id": chosen["ig"]["id"],
-            "page_id": chosen["page"]["id"],
-            "page_name": chosen["page"]["name"],
-            "account": {"id": chosen["ig"]["id"], "username": chosen["ig"].get("username"),
-                        "name": chosen["ig"].get("name")},
-            "auth_method": "oauth",
+            "access_token": long_token,
+            "ig_user_id": profile.get("id", ig_uid),
+            "account": profile,
+            "auth_method": "oauth_ig_business_login",
             "consented_at": datetime.now(timezone.utc).isoformat(),
         })
         return redirect("/?connected=1")
@@ -215,10 +209,10 @@ def webhook_verify():
     abort(403)
 
 def _signature_ok():
-    if not FB_APP_SECRET:
+    if not IG_APP_SECRET:
         return True  # dev mode
     sig = request.headers.get("X-Hub-Signature-256", "")
-    mac = hmac.new(FB_APP_SECRET.encode(), request.data, hashlib.sha256).hexdigest()
+    mac = hmac.new(IG_APP_SECRET.encode(), request.data, hashlib.sha256).hexdigest()
     return hmac.compare_digest(sig, "sha256=" + mac)
 
 @app.route("/webhook", methods=["POST"])
@@ -247,7 +241,7 @@ def webhook_receive():
 @app.route("/api/status")
 def api_status():
     st = validate_token()
-    st["oauth_configured"] = bool(FB_APP_ID and FB_APP_SECRET)
+    st["oauth_configured"] = bool(IG_APP_ID and IG_APP_SECRET)
     return jsonify(st)
 
 @app.route("/api/connect", methods=["POST"])
@@ -259,7 +253,7 @@ def api_connect():
         return jsonify({"ok": False, "error": "You must accept the disclaimer to continue."}), 400
     if not token or not uid:
         return jsonify({"ok": False, "error": "Access token and Instagram User ID are required."}), 400
-    r = requests.get(f"{FB_API}/{uid}", params={"fields": "id,username,name", "access_token": token}, timeout=15)
+    r = requests.get(f"{IG_GRAPH}/{uid}", params={"fields": "id,username,name", "access_token": token}, timeout=15)
     if r.status_code != 200:
         return jsonify({"ok": False, "error": r.json().get("error", {}).get("message", "Invalid credentials")}), 400
     save_config({"access_token": token, "ig_user_id": uid, "auth_method": "manual",
