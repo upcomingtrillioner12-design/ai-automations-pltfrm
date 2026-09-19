@@ -246,6 +246,14 @@ details[open] summary{color:var(--text);}
       <div class="field-label">Schedule for later (optional)</div>
       <input type="datetime-local" id="pWhen">
 
+      <div class="field-label">Repeat</div>
+      <select id="pFreq">
+        <option value="once">Never — just this once</option>
+        <option value="daily">Daily — same content, every day at this time</option>
+        <option value="weekly">Weekly — same content, same day/time each week</option>
+      </select>
+      <p class="small" id="pFreqHint" style="display:none; margin:-2px 0 8px;">Requires a scheduled date/time above to anchor it.</p>
+
       <div class="error" id="pErr"></div>
       <button class="btn" id="pSubmitBtn">Publish now</button>
     </div>
@@ -432,6 +440,9 @@ function syncPublishForm(){
   $('#pImageUrl').classList.toggle('hidden', t==='REELS');
   $('#pFile').accept = t==='REELS' ? 'video/*' : (t==='STORIES' ? 'image/*,video/*' : 'image/*');
 }
+$('#pFreq').onchange = () => {
+  $('#pFreqHint').style.display = $('#pFreq').value !== 'once' ? 'block' : 'none';
+};
 async function uploadIfNeeded(){
   const f = $('#pFile').files[0];
   if(!f) return null;
@@ -450,18 +461,22 @@ $('#pSubmitBtn').onclick = async () => {
     const type = $('#pType').value;
     let imageUrl = $('#pImageUrl').value.trim();
     let videoUrl = $('#pVideoUrl').value.trim();
+    const freq = $('#pFreq').value;
+    const when = $('#pWhen').value ? new Date($('#pWhen').value).toISOString() : null;
+    if(freq !== 'once' && !when){
+      throw new Error('Pick a date/time above to anchor a repeating post.');
+    }
     const uploaded = await uploadIfNeeded();
     if(uploaded){
       if(type==='REELS') videoUrl = uploaded; else imageUrl = uploaded;
     }
-    const when = $('#pWhen').value ? new Date($('#pWhen').value).toISOString() : null;
     $('#pSubmitBtn').textContent = when ? 'Scheduling…' : 'Publishing…';
     const r = await api('/api/posts','POST',{
       media_type: type, image_url: imageUrl, video_url: videoUrl,
-      caption: $('#pCaption').value, scheduled_time: when
+      caption: $('#pCaption').value, scheduled_time: when, frequency: freq
     });
     if(r.error){ throw new Error(r.error); }
-    $('#pImageUrl').value=''; $('#pVideoUrl').value=''; $('#pCaption').value=''; $('#pWhen').value=''; $('#pFile').value='';
+    $('#pImageUrl').value=''; $('#pVideoUrl').value=''; $('#pCaption').value=''; $('#pWhen').value=''; $('#pFile').value=''; $('#pFreq').value='once'; $('#pFreqHint').style.display='none';
     loadPosts();
   } catch(e){
     $('#pErr').textContent = e.message; $('#pErr').style.display='block';
@@ -474,23 +489,30 @@ function statusBadge(s){
   const color = s==='failed' ? '#dc2626' : (s==='published' ? '#16a34a' : 'var(--muted)');
   return `<span style="color:${color}">${map[s]||s}</span>`;
 }
+function freqLabel(f){
+  return f==='daily' ? 'Repeats daily' : f==='weekly' ? 'Repeats weekly' : null;
+}
 async function loadPosts(){
   const posts = await api('/api/posts');
   const el = $('#postList');
   if(!posts.length){ el.innerHTML = '<div class="empty">No posts yet.</div>'; return; }
-  el.innerHTML = posts.map(p=>`
+  el.innerHTML = posts.map(p=>{
+    const runs = (p.history||[]).length;
+    const fl = freqLabel(p.frequency);
+    return `
     <div class="card auto">
       <div class="head">
-        <div class="name">${p.media_type}</div>
+        <div class="name">${p.media_type}${fl ? ` · <span style="color:var(--text);font-weight:600;">${fl}</span>` : ''}</div>
         ${statusBadge(p.status)}
       </div>
       ${p.caption ? `<div class="desc" style="font-style:italic;">"${esc(p.caption)}"</div>` : ''}
       ${p.error ? `<div class="desc" style="color:#dc2626;">${esc(p.error)}</div>` : ''}
       <div class="meta">
-        <span>${p.scheduled_time ? 'Scheduled for ' + new Date(p.scheduled_time).toLocaleString() : new Date(p.created_at).toLocaleString()}</span>
-        ${(p.status==='scheduled'||p.status==='failed') ? `<span style="cursor:pointer;color:#dc2626;" onclick="deletePost('${p.id}')">Remove</span>` : ''}
+        <span>${p.status==='scheduled' ? 'Next run · ' + new Date(p.scheduled_time).toLocaleString() : new Date(p.created_at).toLocaleString()}${fl ? ` · ${runs} run${runs===1?'':'s'} so far` : ''}</span>
+        ${(p.status==='scheduled'||p.status==='failed') ? `<span style="cursor:pointer;color:#dc2626;" onclick="deletePost('${p.id}')">${fl?'Stop repeating':'Remove'}</span>` : ''}
       </div>
-    </div>`).join('');
+    </div>`;
+  }).join('');
 }
 async function deletePost(id){
   if(!confirm('Remove this post entry?')) return;
