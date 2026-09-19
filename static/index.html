@@ -147,6 +147,11 @@ details[open] summary{color:var(--text);}
     <h1>Instagram</h1>
     <p class="sub">Automations that run for you.</p>
 
+    <div class="row" style="margin-bottom:26px;">
+      <button class="btn ghost" onclick="show('publishView'); loadPosts();">Publish</button>
+      <button class="btn ghost" onclick="show('insightsView'); loadInsights();">Insights</button>
+    </div>
+
     <div class="card" style="padding:20px;">
       <div style="margin-bottom:16px;"><b style="font-size:15px;">New automation</b></div>
       <div class="step-label"><span>When</span> something happens</div>
@@ -214,6 +219,48 @@ details[open] summary{color:var(--text);}
     <button class="btn" id="turnOnBtn">Turn on automation</button>
     <p class="small">The automation starts working as soon as your webhook receives comment events (see README, step 4).</p>
   </div>
+
+  <!-- ============ PUBLISH ============ -->
+  <div id="publishView" class="hidden">
+    <button class="back" onclick="show('mainView')">‹ Back</button>
+    <h1>Publish</h1>
+    <p class="sub">Post to your Instagram feed, Reels, or Stories.</p>
+
+    <div class="card flow-card">
+      <div class="field-label">Type</div>
+      <select id="pType" onchange="syncPublishForm()">
+        <option value="IMAGE">Feed photo</option>
+        <option value="REELS">Reel (video)</option>
+        <option value="STORIES">Story</option>
+      </select>
+
+      <div class="field-label">Media</div>
+      <input type="file" id="pFile" accept="image/*,video/*" style="margin-bottom:8px;">
+      <p class="small" style="margin:0 0 10px;">or paste a public URL instead</p>
+      <input type="text" id="pImageUrl" placeholder="https://.../photo.jpg">
+      <input type="text" id="pVideoUrl" class="hidden" placeholder="https://.../video.mp4">
+
+      <div class="field-label">Caption</div>
+      <textarea id="pCaption" placeholder="Write a caption…" style="min-height:70px;"></textarea>
+
+      <div class="field-label">Schedule for later (optional)</div>
+      <input type="datetime-local" id="pWhen">
+
+      <div class="error" id="pErr"></div>
+      <button class="btn" id="pSubmitBtn">Publish now</button>
+    </div>
+
+    <h2>Your posts</h2>
+    <div id="postList"></div>
+  </div>
+
+  <!-- ============ INSIGHTS ============ -->
+  <div id="insightsView" class="hidden">
+    <button class="back" onclick="show('mainView')">‹ Back</button>
+    <h1>Insights</h1>
+    <p class="sub">Account and recent-post performance.</p>
+    <div id="insightsBody"><div class="empty">Loading…</div></div>
+  </div>
 </div>
 
 <script>
@@ -240,7 +287,7 @@ document.querySelectorAll('#themePicker button').forEach(b=>{
     document.querySelectorAll('#themePicker button').forEach(x=>x.classList.toggle('active', x===b)); };
 });
 
-function show(id){ ['connectView','mainView','createView'].forEach(v=>$('#'+v).classList.toggle('hidden', v!==id)); }
+function show(id){ ['connectView','mainView','createView','publishView','insightsView'].forEach(v=>$('#'+v).classList.toggle('hidden', v!==id)); }
 
 /* ---------- status ---------- */
 async function refreshStatus(){
@@ -377,6 +424,105 @@ async function editAuto(id){
 
 refreshStatus();
 setInterval(()=>{ if(status&&status.connected) loadAutos(); }, 30000);
+
+/* ---------- publish ---------- */
+function syncPublishForm(){
+  const t = $('#pType').value;
+  $('#pVideoUrl').classList.toggle('hidden', t==='IMAGE');
+  $('#pImageUrl').classList.toggle('hidden', t==='REELS');
+  $('#pFile').accept = t==='REELS' ? 'video/*' : (t==='STORIES' ? 'image/*,video/*' : 'image/*');
+}
+async function uploadIfNeeded(){
+  const f = $('#pFile').files[0];
+  if(!f) return null;
+  const fd = new FormData(); fd.append('file', f);
+  const r = await fetch('/api/upload', {method:'POST', body: fd}).then(x=>x.json());
+  if(!r.ok) throw new Error(r.error || 'Upload failed');
+  if(r.warning) throw new Error(r.warning);
+  return r.url;
+}
+$('#pSubmitBtn').onclick = async () => {
+  $('#pErr').style.display='none';
+  $('#pSubmitBtn').disabled = true;
+  const prevText = $('#pSubmitBtn').textContent;
+  $('#pSubmitBtn').textContent = 'Uploading…';
+  try{
+    const type = $('#pType').value;
+    let imageUrl = $('#pImageUrl').value.trim();
+    let videoUrl = $('#pVideoUrl').value.trim();
+    const uploaded = await uploadIfNeeded();
+    if(uploaded){
+      if(type==='REELS') videoUrl = uploaded; else imageUrl = uploaded;
+    }
+    const when = $('#pWhen').value ? new Date($('#pWhen').value).toISOString() : null;
+    $('#pSubmitBtn').textContent = when ? 'Scheduling…' : 'Publishing…';
+    const r = await api('/api/posts','POST',{
+      media_type: type, image_url: imageUrl, video_url: videoUrl,
+      caption: $('#pCaption').value, scheduled_time: when
+    });
+    if(r.error){ throw new Error(r.error); }
+    $('#pImageUrl').value=''; $('#pVideoUrl').value=''; $('#pCaption').value=''; $('#pWhen').value=''; $('#pFile').value='';
+    loadPosts();
+  } catch(e){
+    $('#pErr').textContent = e.message; $('#pErr').style.display='block';
+  } finally {
+    $('#pSubmitBtn').disabled = false; $('#pSubmitBtn').textContent = prevText;
+  }
+};
+function statusBadge(s){
+  const map = {scheduled:'Scheduled', processing:'Processing…', published:'Published', failed:'Failed'};
+  const color = s==='failed' ? '#dc2626' : (s==='published' ? '#16a34a' : 'var(--muted)');
+  return `<span style="color:${color}">${map[s]||s}</span>`;
+}
+async function loadPosts(){
+  const posts = await api('/api/posts');
+  const el = $('#postList');
+  if(!posts.length){ el.innerHTML = '<div class="empty">No posts yet.</div>'; return; }
+  el.innerHTML = posts.map(p=>`
+    <div class="card auto">
+      <div class="head">
+        <div class="name">${p.media_type}</div>
+        ${statusBadge(p.status)}
+      </div>
+      ${p.caption ? `<div class="desc" style="font-style:italic;">"${esc(p.caption)}"</div>` : ''}
+      ${p.error ? `<div class="desc" style="color:#dc2626;">${esc(p.error)}</div>` : ''}
+      <div class="meta">
+        <span>${p.scheduled_time ? 'Scheduled for ' + new Date(p.scheduled_time).toLocaleString() : new Date(p.created_at).toLocaleString()}</span>
+        ${(p.status==='scheduled'||p.status==='failed') ? `<span style="cursor:pointer;color:#dc2626;" onclick="deletePost('${p.id}')">Remove</span>` : ''}
+      </div>
+    </div>`).join('');
+}
+async function deletePost(id){
+  if(!confirm('Remove this post entry?')) return;
+  const r = await api(`/api/posts/${id}`,'DELETE');
+  if(r.error) alert(r.error);
+  loadPosts();
+}
+
+/* ---------- insights ---------- */
+async function loadInsights(){
+  const el = $('#insightsBody');
+  el.innerHTML = '<div class="empty">Loading…</div>';
+  const r = await api('/api/insights');
+  if(!r.ok){ el.innerHTML = `<div class="empty">${esc(r.error||'Failed to load insights.')}</div>`; return; }
+  const a = r.account;
+  el.innerHTML = `
+    <div class="card" style="display:flex; justify-content:space-around; text-align:center; margin-bottom:20px;">
+      <div><div style="font-size:22px;font-weight:700;">${a.followers_count ?? '—'}</div><div class="small" style="margin:0;">Followers</div></div>
+      <div><div style="font-size:22px;font-weight:700;">${a.follows_count ?? '—'}</div><div class="small" style="margin:0;">Following</div></div>
+      <div><div style="font-size:22px;font-weight:700;">${a.media_count ?? '—'}</div><div class="small" style="margin:0;">Posts</div></div>
+    </div>
+    <h2 style="margin-top:0;">Recent posts</h2>
+    ${r.media.length ? r.media.map(m=>`
+      <div class="card auto">
+        <div class="desc">${esc((m.caption||'').slice(0,120))}${(m.caption||'').length>120?'…':''}</div>
+        <div class="meta">
+          <span>❤ ${m.like_count ?? 0} · 💬 ${m.comments_count ?? 0}</span>
+          <span>${new Date(m.timestamp).toLocaleDateString()}</span>
+        </div>
+      </div>`).join('') : '<div class="empty">No posts yet.</div>'}
+    <p class="small">Deeper analytics (reach, impressions) require the additional <code>instagram_manage_insights</code> permission and Meta App Review — not enabled in this build.</p>`;
+}
 </script>
 </body>
 </html>
