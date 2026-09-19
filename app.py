@@ -5,7 +5,7 @@ Auth: Meta OAuth (Facebook Login) — user clicks "Continue with Instagram",
 grants permissions, and this app exchanges the code for tokens automatically.
 """
 import os, json, time, hmac, hashlib, threading, urllib.parse, uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from werkzeug.utils import secure_filename
 from flask import Flask, request, jsonify, send_from_directory, abort, redirect
 import requests
@@ -234,8 +234,30 @@ def run_publish_job(pid):
             update_post(pid, status="failed",
                         error=j.get("error", {}).get("message", "Publish failed"))
             return
-        update_post(pid, status="published", media_id=j["id"],
-                    published_at=datetime.now(timezone.utc).isoformat())
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        history = post.get("history") or []
+        history.append({"published_at": now_iso, "media_id": j["id"]})
+        freq = post.get("frequency", "once")
+
+        if freq in ("daily", "weekly"):
+            # Anchor the next run to the *previous scheduled time* (not the
+            # actual publish time) so occasional delays don't drift the
+            # schedule later and later. Falls back to now if unset.
+            prev = post.get("scheduled_time")
+            base = datetime.fromisoformat(prev.replace("Z", "+00:00")) if prev else datetime.now(timezone.utc)
+            step = timedelta(days=1) if freq == "daily" else timedelta(days=7)
+            next_run = base + step
+            # If a previous run was skipped/delayed past its slot, jump
+            # forward to the next slot that's actually in the future.
+            now = datetime.now(timezone.utc)
+            while next_run <= now:
+                next_run += step
+            update_post(pid, status="scheduled", scheduled_time=next_run.isoformat(),
+                        container_id=None, media_id=j["id"], error=None, history=history)
+        else:
+            update_post(pid, status="published", media_id=j["id"],
+                        published_at=now_iso, history=history)
     except Exception as e:
         update_post(pid, status="failed", error=str(e))
 
@@ -477,12 +499,20 @@ def api_posts_create():
         if when <= datetime.now(timezone.utc):
             return jsonify({"ok": False, "error": "scheduled_time must be in the future."}), 400
 
+    frequency = (d.get("frequency") or "once").strip().lower()
+    if frequency not in ("once", "daily", "weekly"):
+        return jsonify({"ok": False, "error": "frequency must be once, daily, or weekly."}), 400
+    if frequency != "once" and not scheduled_time:
+        return jsonify({"ok": False, "error": "A repeating post needs a first scheduled_time to anchor it."}), 400
+
     pid = "p" + str(int(time.time() * 1000))
     post = {
         "id": pid, "media_type": media_type,
         "image_url": image_url or None, "video_url": video_url or None,
         "caption": (d.get("caption") or "").strip(),
         "scheduled_time": scheduled_time,
+        "frequency": frequency,
+        "history": [],
         "status": "scheduled" if scheduled_time else "processing",
         "container_id": None, "media_id": None, "error": None,
         "created_at": datetime.now(timezone.utc).isoformat(),
