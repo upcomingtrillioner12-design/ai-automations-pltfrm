@@ -1,28 +1,38 @@
 """
 Insta-Automate — minimal Instagram automation (official Graph API only).
 Triggers: comment -> reply, keyword -> DM.
-Auth: Instagram API with Instagram Login ("Instagram business login") —
-user clicks "Continue with Instagram", grants permissions, and this app
-exchanges the code for tokens automatically. No Facebook Page required.
+Auth: Meta OAuth (Facebook Login) — user clicks "Continue with Instagram",
+grants permissions, and this app exchanges the code for tokens automatically.
 """
-import os, json, time, hmac, hashlib, threading, urllib.parse
+import os, json, time, hmac, hashlib, threading, urllib.parse, uuid
 from datetime import datetime, timezone
+from werkzeug.utils import secure_filename
 from flask import Flask, request, jsonify, send_from_directory, abort, redirect
 import requests
 from dotenv import load_dotenv
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(BASE, ".env"))
+load_dotenv(os.path.join(BASE, ".env"))  # <-- .env was never loaded before; FB_APP_ID/APP_SECRET were always empty
 
+# Instagram API with Instagram Login ("Instagram business login") — no
+# Facebook Page required, user logs in directly with their Instagram
+# Business/Creator account. Different endpoints/tokens than classic
+# Facebook Login, so the base URLs below are Instagram-specific.
 IG_OAUTH = "https://www.instagram.com/oauth/authorize"
-IG_TOKEN_URL = "https://api.instagram.com/oauth/access_token"
-IG_GRAPH = "https://graph.instagram.com/v21.0"
+IG_TOKEN_URL = "https://api.instagram.com/oauth/access_token"       # short-lived token
+IG_GRAPH = "https://graph.instagram.com/v21.0"                       # long-lived token + all API calls
 DATA = os.path.join(BASE, "data")
 os.makedirs(DATA, exist_ok=True)
 
 AUTOMATIONS_FILE = os.path.join(DATA, "automations.json")
 CONFIG_FILE = os.path.join(DATA, "config.json")
+POSTS_FILE = os.path.join(DATA, "posts.json")
+UPLOADS_DIR = os.path.join(DATA, "uploads")
+os.makedirs(UPLOADS_DIR, exist_ok=True)
+ALLOWED_UPLOAD_EXT = {"jpg", "jpeg", "png", "mp4", "mov"}
 
+# Instagram-business-login scopes (note the "instagram_business_" prefix —
+# these replaced the old instagram_basic/instagram_manage_* names in 2025).
 SCOPES = ",".join([
     "instagram_business_basic",
     "instagram_business_manage_comments",
@@ -32,18 +42,21 @@ SCOPES = ",".join([
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
 
+# ---------------- config / env ----------------
 def env(k, d=""):
     v = os.getenv(k, "").strip()
     return v if v else d
 
-# Accept either naming: IG_APP_ID / INSTAGRAM_APP_ID (and same for secret).
-IG_APP_ID = env("IG_APP_ID") or env("INSTAGRAM_APP_ID") or env("FB_APP_ID")
-IG_APP_SECRET = (env("IG_APP_SECRET") or env("INSTAGRAM_APP_SECRET")
-                 or env("APP_SECRET"))
+# Instagram business login can use its own App ID/Secret (App Dashboard ->
+# Instagram -> API setup with Instagram login -> "Instagram app ID/secret").
+# Falls back to the main Meta app id/secret if you haven't set separate ones.
+IG_APP_ID = env("IG_APP_ID") or env("FB_APP_ID")
+IG_APP_SECRET = env("IG_APP_SECRET") or env("APP_SECRET")
 VERIFY_TOKEN = env("WEBHOOK_VERIFY_TOKEN", "dev-verify-token")
-REDIRECT_URI = env("OAUTH_REDIRECT_URI")
+REDIRECT_URI = env("OAUTH_REDIRECT_URI")  # e.g. https://your-url/api/oauth/callback
 BASE_URL = env("WEBHOOK_BASE_URL", "http://localhost:5000")
 
+# ---------------- storage ----------------
 def _load(path, default):
     try: return json.load(open(path))
     except Exception: return default
@@ -57,7 +70,21 @@ get_config = lambda: _load(CONFIG_FILE, {})
 save_config = lambda cfg: _save(CONFIG_FILE, cfg)
 get_automations = lambda: _load(AUTOMATIONS_FILE, [])
 save_autos = lambda a: _save(AUTOMATIONS_FILE, a)
+get_posts = lambda: _load(POSTS_FILE, [])
+save_posts = lambda p: _save(POSTS_FILE, p)
+_posts_lock = threading.Lock()
 
+def update_post(pid, **fields):
+    with _posts_lock:
+        posts = get_posts()
+        for p in posts:
+            if p["id"] == pid:
+                p.update(fields)
+                save_posts(posts)
+                return p
+    return None
+
+# ---------------- Instagram API helpers ----------------
 def ig_token():
     return get_config().get("access_token") or ""
 
@@ -73,6 +100,8 @@ def ig_post(path, data=None, token=None):
     return requests.post(f"{IG_GRAPH}/{path}", data=p, timeout=20)
 
 def ig_post_json(path, payload=None, token=None):
+    """Some Graph API endpoints (e.g. /messages) require a nested JSON body,
+    not flat form fields. Access token goes in the query string instead."""
     return requests.post(f"{IG_GRAPH}/{path}",
                           params={"access_token": token or ig_token()},
                           json=payload or {}, timeout=20)
@@ -81,15 +110,13 @@ def validate_token():
     uid, tok = ig_user_id(), ig_token()
     if not uid or not tok:
         return {"ok": False, "connected": False, "error": "No credentials saved"}
-    r = requests.get(f"{IG_GRAPH}/{uid}",
-                     params={"fields": "id,username,name", "access_token": tok},
-                     timeout=15)
+    r = requests.get(f"{IG_GRAPH}/{uid}", params={"fields": "id,username,name", "access_token": tok}, timeout=15)
     if r.status_code == 200:
         info = r.json(); info["auth_method"] = get_config().get("auth_method", "manual")
         return {"ok": True, "connected": True, "account": info}
-    return {"ok": False, "connected": False,
-            "error": r.json().get("error", {}).get("message", "Token invalid")}
+    return {"ok": False, "connected": False, "error": r.json().get("error", {}).get("message", "Token invalid")}
 
+# ---------------- OAuth ----------------
 def oauth_redirect_uri():
     return REDIRECT_URI or f"{BASE_URL}/api/oauth/callback"
 
@@ -119,8 +146,7 @@ def oauth_callback():
         if "access_token" not in j:
             return redirect(f"/?oauth_error={urllib.parse.quote(j.get('error_message', j.get('error', 'token exchange failed')))}")
         short_token = j["access_token"]
-        # Instagram sometimes nests user_id inside "data"; handle both shapes.
-        ig_uid = j.get("user_id") or (j.get("data") or {}).get("user_id")
+        ig_uid = j.get("user_id")
         # 2. short-lived -> long-lived token (60 days, refreshable)
         r = requests.get(f"{IG_GRAPH}/access_token", params={
             "grant_type": "ig_exchange_token",
@@ -141,6 +167,97 @@ def oauth_callback():
     except Exception as e:
         return redirect(f"/?oauth_error={urllib.parse.quote(str(e))}")
 
+# ---------------- publishing engine ----------------
+def ig_media_container(caption, image_url=None, video_url=None, media_type=None):
+    payload = {"caption": caption or ""}
+    media_type = (media_type or "IMAGE").upper()
+    if media_type == "REELS":
+        payload["media_type"] = "REELS"
+        payload["video_url"] = video_url
+    elif media_type == "STORIES":
+        payload["media_type"] = "STORIES"
+        if video_url:
+            payload["video_url"] = video_url
+        else:
+            payload["image_url"] = image_url
+    else:
+        payload["image_url"] = image_url
+    return ig_post(f"{ig_user_id()}/media", payload)
+
+def ig_container_status(container_id):
+    return ig_get(container_id, {"fields": "status_code,status"})
+
+def ig_publish_container(container_id):
+    return ig_post(f"{ig_user_id()}/media_publish", {"creation_id": container_id})
+
+def run_publish_job(pid):
+    """Runs in a background thread: create the media container (if not already
+    created), poll until Meta finishes processing it (videos/Reels can take
+    seconds to minutes), then publish. Updates the post's status as it goes so
+    the UI can show live progress instead of a frozen 'Publishing…' spinner."""
+    post = next((p for p in get_posts() if p["id"] == pid), None)
+    if not post:
+        return
+    try:
+        if not post.get("container_id"):
+            r = ig_media_container(post.get("caption", ""),
+                                    image_url=post.get("image_url"),
+                                    video_url=post.get("video_url"),
+                                    media_type=post.get("media_type"))
+            j = r.json()
+            if r.status_code != 200 or "id" not in j:
+                update_post(pid, status="failed",
+                            error=j.get("error", {}).get("message", "Container creation failed"))
+                return
+            post = update_post(pid, container_id=j["id"], status="processing")
+
+        container_id = post["container_id"]
+        # Images finish almost instantly; video/Reels processing can take a
+        # few minutes. Poll for up to ~8 minutes before giving up.
+        for _ in range(96):
+            r = ig_container_status(container_id)
+            j = r.json()
+            code = j.get("status_code")
+            if code == "FINISHED":
+                break
+            if code == "ERROR":
+                update_post(pid, status="failed", error=j.get("status", "Media processing failed"))
+                return
+            time.sleep(5)
+        else:
+            update_post(pid, status="failed", error="Timed out waiting for media to process")
+            return
+
+        r = ig_publish_container(container_id)
+        j = r.json()
+        if r.status_code != 200 or "id" not in j:
+            update_post(pid, status="failed",
+                        error=j.get("error", {}).get("message", "Publish failed"))
+            return
+        update_post(pid, status="published", media_id=j["id"],
+                    published_at=datetime.now(timezone.utc).isoformat())
+    except Exception as e:
+        update_post(pid, status="failed", error=str(e))
+
+def _scheduler_loop():
+    """Polls scheduled_time on stored posts; when due, kicks off run_publish_job.
+    A simple loop, not a cron library — good enough for a single-process app."""
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            for p in get_posts():
+                if p.get("status") == "scheduled":
+                    when = p.get("scheduled_time")
+                    if when and datetime.fromisoformat(when.replace("Z", "+00:00")) <= now:
+                        update_post(p["id"], status="processing")
+                        threading.Thread(target=run_publish_job, args=(p["id"],), daemon=True).start()
+        except Exception as e:
+            print("scheduler loop error:", e)
+        time.sleep(20)
+
+threading.Thread(target=_scheduler_loop, daemon=True).start()
+
+# ---------------- automation engine ----------------
 def mark_run(aid, success=True, note=""):
     autos = get_automations()
     for a in autos:
@@ -154,6 +271,10 @@ PROCESSED_FILE = os.path.join(DATA, "processed_comments.json")
 _processed_lock = threading.Lock()
 
 def already_processed(comment_id):
+    """Meta redelivers webhook events on retry/timeout, and our own auto-replies
+    land back on the same webhook as new comments. Without dedup + self-filtering
+    the bot would reply to its own replies forever. Keep a rolling window of the
+    last N processed comment ids on disk."""
     if not comment_id:
         return True
     with _processed_lock:
@@ -167,6 +288,8 @@ def already_processed(comment_id):
         return False
 
 def handle_comment(commenter_id, commenter_username, text, comment_id):
+    # Never react to comments made by the connected account itself
+    # (e.g. its own auto-reply) — that would create an infinite reply loop.
     if commenter_id and commenter_id == ig_user_id():
         return
     if already_processed(comment_id):
@@ -186,6 +309,7 @@ def handle_comment(commenter_id, commenter_username, text, comment_id):
                 mark_run(a["id"], r.status_code == 200,
                          r.json().get("error", {}).get("message", "") if r.status_code != 200 else "")
 
+# ---------------- webhook ----------------
 @app.route("/webhook", methods=["GET"])
 def webhook_verify():
     if request.args.get("hub.mode") == "subscribe" and request.args.get("hub.verify_token") == VERIFY_TOKEN:
@@ -194,7 +318,7 @@ def webhook_verify():
 
 def _signature_ok():
     if not IG_APP_SECRET:
-        return True
+        return True  # dev mode
     sig = request.headers.get("X-Hub-Signature-256", "")
     mac = hmac.new(IG_APP_SECRET.encode(), request.data, hashlib.sha256).hexdigest()
     return hmac.compare_digest(sig, "sha256=" + mac)
@@ -221,6 +345,7 @@ def webhook_receive():
     threading.Thread(target=process, daemon=True).start()
     return "ok", 200
 
+# ---------------- API ----------------
 @app.route("/api/status")
 def api_status():
     st = validate_token()
@@ -229,15 +354,14 @@ def api_status():
 
 @app.route("/api/connect", methods=["POST"])
 def api_connect():
+    """Manual consent-based fallback (owner enters their own credentials)."""
     d = request.get_json(force=True)
     token, uid = (d.get("access_token") or "").strip(), (d.get("ig_user_id") or "").strip()
     if d.get("consent") is not True:
         return jsonify({"ok": False, "error": "You must accept the disclaimer to continue."}), 400
     if not token or not uid:
         return jsonify({"ok": False, "error": "Access token and Instagram User ID are required."}), 400
-    r = requests.get(f"{IG_GRAPH}/{uid}",
-                     params={"fields": "id,username,name", "access_token": token},
-                     timeout=15)
+    r = requests.get(f"{IG_GRAPH}/{uid}", params={"fields": "id,username,name", "access_token": token}, timeout=15)
     if r.status_code != 200:
         return jsonify({"ok": False, "error": r.json().get("error", {}).get("message", "Invalid credentials")}), 400
     save_config({"access_token": token, "ig_user_id": uid, "auth_method": "manual",
@@ -301,12 +425,109 @@ def api_delete(aid):
     save_autos([a for a in get_automations() if a["id"] != aid])
     return jsonify({"ok": True})
 
+# ---------------- publish / schedule API ----------------
+@app.route("/api/upload", methods=["POST"])
+def api_upload():
+    """Accepts a local file and returns a public URL Meta can fetch. Requires
+    WEBHOOK_BASE_URL to be a real public HTTPS URL (ngrok/deployed) — Meta's
+    servers must be able to reach it, localhost will not work."""
+    f = request.files.get("file")
+    if not f or not f.filename:
+        return jsonify({"ok": False, "error": "No file uploaded."}), 400
+    ext = f.filename.rsplit(".", 1)[-1].lower() if "." in f.filename else ""
+    if ext not in ALLOWED_UPLOAD_EXT:
+        return jsonify({"ok": False, "error": f"Unsupported file type .{ext}"}), 400
+    fname = f"{uuid.uuid4().hex}.{ext}"
+    f.save(os.path.join(UPLOADS_DIR, secure_filename(fname)))
+    url = f"{BASE_URL.rstrip('/')}/media/{fname}"
+    warning = None
+    if "localhost" in BASE_URL or "127.0.0.1" in BASE_URL:
+        warning = "WEBHOOK_BASE_URL is still localhost — Meta's servers can't fetch this file until you set it to a public HTTPS URL (ngrok or a real deployment) and restart."
+    return jsonify({"ok": True, "url": url, "warning": warning})
+
+@app.route("/media/<path:filename>")
+def serve_media(filename):
+    return send_from_directory(UPLOADS_DIR, filename)
+
+@app.route("/api/posts", methods=["GET"])
+def api_posts_list():
+    return jsonify(sorted(get_posts(), key=lambda p: p.get("created_at", ""), reverse=True))
+
+@app.route("/api/posts", methods=["POST"])
+def api_posts_create():
+    d = request.get_json(force=True)
+    media_type = (d.get("media_type") or "IMAGE").upper()
+    if media_type not in ("IMAGE", "REELS", "STORIES"):
+        return jsonify({"ok": False, "error": "Unsupported media_type."}), 400
+    image_url = (d.get("image_url") or "").strip()
+    video_url = (d.get("video_url") or "").strip()
+    if media_type == "REELS" and not video_url:
+        return jsonify({"ok": False, "error": "video_url is required for Reels."}), 400
+    if media_type in ("IMAGE",) and not image_url:
+        return jsonify({"ok": False, "error": "image_url is required."}), 400
+    if media_type == "STORIES" and not (image_url or video_url):
+        return jsonify({"ok": False, "error": "image_url or video_url is required for Stories."}), 400
+
+    scheduled_time = (d.get("scheduled_time") or "").strip() or None
+    if scheduled_time:
+        try:
+            when = datetime.fromisoformat(scheduled_time.replace("Z", "+00:00"))
+        except ValueError:
+            return jsonify({"ok": False, "error": "scheduled_time must be ISO 8601."}), 400
+        if when <= datetime.now(timezone.utc):
+            return jsonify({"ok": False, "error": "scheduled_time must be in the future."}), 400
+
+    pid = "p" + str(int(time.time() * 1000))
+    post = {
+        "id": pid, "media_type": media_type,
+        "image_url": image_url or None, "video_url": video_url or None,
+        "caption": (d.get("caption") or "").strip(),
+        "scheduled_time": scheduled_time,
+        "status": "scheduled" if scheduled_time else "processing",
+        "container_id": None, "media_id": None, "error": None,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "published_at": None,
+    }
+    posts = get_posts(); posts.append(post); save_posts(posts)
+    if not scheduled_time:
+        threading.Thread(target=run_publish_job, args=(pid,), daemon=True).start()
+    return jsonify(post), 201
+
+@app.route("/api/posts/<pid>", methods=["DELETE"])
+def api_posts_delete(pid):
+    posts = get_posts()
+    target = next((p for p in posts if p["id"] == pid), None)
+    if not target:
+        abort(404)
+    if target["status"] not in ("scheduled", "failed"):
+        return jsonify({"ok": False, "error": "Only scheduled or failed posts can be removed."}), 400
+    save_posts([p for p in posts if p["id"] != pid])
+    return jsonify({"ok": True})
+
+@app.route("/api/insights")
+def api_insights():
+    if not (ig_user_id() and ig_token()):
+        return jsonify({"ok": False, "error": "Not connected."}), 400
+    acct = ig_get(ig_user_id(), {"fields": "username,followers_count,follows_count,media_count"})
+    if acct.status_code != 200:
+        return jsonify({"ok": False, "error": acct.json().get("error", {}).get("message", "Failed to load account")}), 400
+    media = ig_get(f"{ig_user_id()}/media", {
+        "fields": "id,caption,media_type,media_url,thumbnail_url,permalink,timestamp,like_count,comments_count",
+        "limit": 12,
+    })
+    return jsonify({
+        "ok": True,
+        "account": acct.json(),
+        "media": media.json().get("data", []) if media.status_code == 200 else [],
+    })
+
 @app.route("/")
 def index():
     return send_from_directory("static", "index.html")
 
 @app.route("/healthz")
 def healthz():
+    # Simple liveness endpoint for hosting platforms (Render/Railway/etc.)
     return jsonify({"ok": True}), 200
 
 if __name__ == "__main__":
